@@ -3,44 +3,92 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="16dp">
+    android:padding="14dp">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:layout_marginBottom="12dp">
+        android:layout_marginBottom="8dp">
 
         <Button
-            android:id="@+id/btnDetect"
+            android:id="@+id/btnScan"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Detect Printer"
-            android:layout_marginEnd="8dp" />
+            android:text="Scan Document"
+            android:layout_marginEnd="6dp" />
+
+        <Button
+            android:id="@+id/btnSave"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Save"
+            android:enabled="false" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="8dp">
+
+        <RadioGroup
+            android:id="@+id/rgColor"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="horizontal">
+
+            <RadioButton
+                android:id="@+id/rbColor"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Color"
+                android:checked="true"
+                android:layout_marginEnd="12dp" />
+
+            <RadioButton
+                android:id="@+id/rbGray"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Grayscale" />
+        </RadioGroup>
 
         <Button
             android:id="@+id/btnCopy"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Copy Log" />
+            android:text="Copy Log"
+            android:textSize="12sp" />
     </LinearLayout>
+
+    <ImageView
+        android:id="@+id/ivPreview"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="2"
+        android:background="#E8E8E8"
+        android:scaleType="fitCenter"
+        android:contentDescription="Scanned document preview"
+        android:layout_marginBottom="8dp" />
 
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
         android:background="#F4F4F4"
-        android:padding="10dp">
+        android:padding="8dp">
 
         <TextView
             android:id="@+id/tvLog"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:fontFamily="monospace"
-            android:text="Plug in your HP DeskJet 2331 via OTG and tap 'Detect Printer'."
+            android:text="Place a document on the scanner glass, plug in OTG, and tap 'Scan Document'."
             android:textColor="#111111"
-            android:textSize="12sp"
+            android:textSize="11sp"
             android:textIsSelectable="true" />
     </ScrollView>
 </LinearLayout>
