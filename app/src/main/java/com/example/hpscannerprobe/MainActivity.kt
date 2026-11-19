@@ -131,17 +131,20 @@ class MainActivity : AppCompatActivity() {
             }
 
             try {
-                val httpInterfaces = mutableListOf<UsbInterface>()
+                // Prioritize Interface #0 (Class 255, Subclass 204 = HP Raw Scan)
+                val targetInterfaces = mutableListOf<UsbInterface>()
                 for (i in 0 until device.interfaceCount) {
                     val intf = device.getInterface(i)
-                    if (intf.interfaceClass == 255 && intf.interfaceSubclass == 4 && intf.interfaceProtocol == 1) {
-                        httpInterfaces.add(intf)
+                    if (intf.interfaceClass == 255 && intf.interfaceSubclass == 204) {
+                        targetInterfaces.add(0, intf)
+                    } else if (intf.interfaceClass == 255 && intf.interfaceSubclass == 4) {
+                        targetInterfaces.add(intf)
                     }
                 }
 
                 var scannedBytes: ByteArray? = null
-                for (intf in httpInterfaces) {
-                    log("Trying Interface #${intf.id}...")
+                for (intf in targetInterfaces) {
+                    log("Trying Interface #${intf.id} (${intf.interfaceClass}/${intf.interfaceSubclass}/${intf.interfaceProtocol})...")
                     if (!connection.claimInterface(intf, true)) {
                         log("Could not claim Interface #${intf.id}")
                         continue
@@ -158,15 +161,24 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     if (epOut != null && epIn != null) {
-                        // Step A: Probe if LEDM HTTP server responds
-                        val probeReq = "GET /DevMgmt/DiscoveryTree.xml HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-                        val probeResp = sendHttpOverUsb(connection, epOut, epIn, probeReq.toByteArray(), 4000)
-                        if (probeResp != null) {
-                            val firstLine = String(probeResp, Charsets.ISO_8859_1).lineSequence().firstOrNull() ?: ""
-                            log("LEDM Probe: $firstLine")
+                        // Probe 1: HP LEDM Discovery
+                        val ledmProbe = "GET /DevMgmt/DiscoveryTree.xml HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                        val ledmResp = sendHttpOverUsb(connection, epOut, epIn, ledmProbe.toByteArray(), 3000)
+                        if (ledmResp != null) {
+                            val firstLine = String(ledmResp, Charsets.ISO_8859_1).lineSequence().firstOrNull() ?: ""
+                            log("LEDM Reply: $firstLine")
                             scannedBytes = tryLedmScan(connection, epOut, epIn, isColor)
                         } else {
-                            log("No LEDM probe response on Interface #${intf.id}.")
+                            // Probe 2: eSCL Capabilities
+                            val esclProbe = "GET /eSCL/ScannerCapabilities HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                            val esclResp = sendHttpOverUsb(connection, epOut, epIn, esclProbe.toByteArray(), 3000)
+                            if (esclResp != null) {
+                                val firstLine = String(esclResp, Charsets.ISO_8859_1).lineSequence().firstOrNull() ?: ""
+                                log("eSCL Reply: $firstLine")
+                                scannedBytes = tryEsclScan(connection, epOut, epIn, isColor)
+                            } else {
+                                log("No HTTP reply on Interface #${intf.id}.")
+                            }
                         }
                     }
 
@@ -220,13 +232,6 @@ class MainActivity : AppCompatActivity() {
               <scan:BitDepth>8</scan:BitDepth>
               <scan:InputSource>Platen</scan:InputSource>
               <scan:GrayRendering>NTSC</scan:GrayRendering>
-              <scan:ToneMap>
-                <scan:Gamma>1000</scan:Gamma>
-                <scan:Brightness>1000</scan:Brightness>
-                <scan:Contrast>1000</scan:Contrast>
-                <scan:Highlite>179</scan:Highlite>
-                <scan:Shadow>25</scan:Shadow>
-              </scan:ToneMap>
               <scan:ContentType>Document</scan:ContentType>
             </scan:ScanJob>
         """.trimIndent()
@@ -238,32 +243,17 @@ class MainActivity : AppCompatActivity() {
                 "\r\n" +
                 scanXml
 
-        log("Sending HP LEDM ScanJob ($colorSpace, 200 DPI)...")
-        val postResp = sendHttpOverUsb(conn, epOut, epIn, postReq.toByteArray(), 8000)
-        if (postResp == null) {
-            log("No response to POST /Scan/Jobs.")
-            return null
-        }
-
+        log("Sending LEDM ScanJob ($colorSpace, 200 DPI)...")
+        val postResp = sendHttpOverUsb(conn, epOut, epIn, postReq.toByteArray(), 8000) ?: return null
         val respStr = String(postResp, Charsets.ISO_8859_1)
         val firstLine = respStr.lineSequence().firstOrNull() ?: ""
         log("POST /Scan/Jobs -> $firstLine")
-
-        if (!firstLine.contains("201")) {
-            log("Snippet:\n${respStr.take(300)}")
-            return null
-        }
+        if (!firstLine.contains("201")) return null
 
         val locationLine = respStr.lineSequence().firstOrNull { it.startsWith("Location:", ignoreCase = true) }
         val rawLocation = locationLine?.substringAfter(":")?.trim() ?: return null
-        val jobPath = if (rawLocation.startsWith("http")) {
-            "/" + rawLocation.substringAfter("://").substringAfter("/", "")
-        } else {
-            rawLocation
-        }
-        log("Job URL: $jobPath")
+        val jobPath = if (rawLocation.startsWith("http")) "/" + rawLocation.substringAfter("://").substringAfter("/", "") else rawLocation
 
-        // Poll job status to get BinaryURL
         var binaryUrl: String? = null
         for (attempt in 1..10) {
             Thread.sleep(1000)
@@ -279,25 +269,54 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        if (binaryUrl == null) {
-            log("Could not find BinaryURL in job status.")
-            return null
-        }
+        val docUrl = binaryUrl ?: return null
+        val docPath = if (docUrl.startsWith("http")) "/" + docUrl.substringAfter("://").substringAfter("/", "") else docUrl
+        log("Downloading scan (wait 10-20s)...")
+        val docResp = sendHttpOverUsb(conn, epOut, epIn, "GET $docPath HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(), 25000) ?: return null
+        return extractHttpBody(docResp)
+    }
 
-        val docPath = if (binaryUrl.startsWith("http")) {
-            "/" + binaryUrl.substringAfter("://").substringAfter("/", "")
-        } else {
-            binaryUrl
-        }
+    private fun tryEsclScan(
+        conn: UsbDeviceConnection,
+        epOut: UsbEndpoint,
+        epIn: UsbEndpoint,
+        isColor: Boolean
+    ): ByteArray? {
+        val colorMode = if (isColor) "RGB24" else "Grayscale8"
+        val scanXml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+              <pwg:Version>2.0</pwg:Version>
+              <pwg:ScanRegions>
+                <pwg:ScanRegion>
+                  <pwg:Height>3508</pwg:Height>
+                  <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+                  <pwg:Width>2480</pwg:Width>
+                  <pwg:XOffset>0</pwg:XOffset>
+                  <pwg:YOffset>0</pwg:YOffset>
+                </pwg:ScanRegion>
+              </pwg:ScanRegions>
+              <scan:ColorMode>$colorMode</scan:ColorMode>
+              <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+              <scan:XResolution>200</scan:XResolution>
+              <scan:YResolution>200</scan:YResolution>
+            </scan:ScanSettings>
+        """.trimIndent()
 
-        log("Downloading scan from $docPath (wait 10-20s)...")
-        val getReq = "GET $docPath HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        val docResp = sendHttpOverUsb(conn, epOut, epIn, getReq.toByteArray(), 25000)
-        if (docResp == null) {
-            log("No image data received from BinaryURL.")
-            return null
-        }
+        val postReq = "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/xml\r\nContent-Length: ${scanXml.toByteArray().size}\r\n\r\n$scanXml"
+        log("Sending eSCL ScanJobs ($colorMode, 200 DPI)...")
+        val postResp = sendHttpOverUsb(conn, epOut, epIn, postReq.toByteArray(), 8000) ?: return null
+        val respStr = String(postResp, Charsets.ISO_8859_1)
+        val firstLine = respStr.lineSequence().firstOrNull() ?: ""
+        log("POST /eSCL/ScanJobs -> $firstLine")
+        if (!firstLine.contains("201")) return null
 
+        val locationLine = respStr.lineSequence().firstOrNull { it.startsWith("Location:", ignoreCase = true) }
+        val rawLocation = locationLine?.substringAfter(":")?.trim() ?: return null
+        val jobPath = if (rawLocation.startsWith("http")) "/" + rawLocation.substringAfter("://").substringAfter("/", "") else rawLocation
+
+        log("Downloading eSCL scan (wait 10-20s)...")
+        val docResp = sendHttpOverUsb(conn, epOut, epIn, "GET $jobPath/NextDocument HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(), 25000) ?: return null
         return extractHttpBody(docResp)
     }
 
@@ -308,9 +327,9 @@ class MainActivity : AppCompatActivity() {
         requestBytes: ByteArray,
         firstReadTimeoutMs: Int
     ): ByteArray? {
-        val sent = conn.bulkTransfer(epOut, requestBytes, requestBytes.size, 5000)
+        val sent = conn.bulkTransfer(epOut, requestBytes, requestBytes.size, 3000)
         if (sent < 0) {
-            log("USB bulk OUT failed ($sent)")
+            log("  USB OUT failed ($sent)")
             return null
         }
 
@@ -322,8 +341,9 @@ class MainActivity : AppCompatActivity() {
             val read = conn.bulkTransfer(epIn, buf, buf.size, timeout)
             if (read > 0) {
                 out.write(buf, 0, read)
-                timeout = 1500
+                timeout = 1200
             } else {
+                if (out.size() == 0) log("  USB OUT ok ($sent B), IN returned $read")
                 break
             }
         }
