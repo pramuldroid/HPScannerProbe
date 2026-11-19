@@ -131,18 +131,12 @@ class MainActivity : AppCompatActivity() {
             }
 
             try {
-                // Find HP HTTP-over-USB interfaces (Class 255, Subclass 4, Protocol 1)
                 val httpInterfaces = mutableListOf<UsbInterface>()
                 for (i in 0 until device.interfaceCount) {
                     val intf = device.getInterface(i)
                     if (intf.interfaceClass == 255 && intf.interfaceSubclass == 4 && intf.interfaceProtocol == 1) {
                         httpInterfaces.add(intf)
                     }
-                }
-
-                if (httpInterfaces.isEmpty()) {
-                    log("No HP HTTP-over-USB interface (255/4/1) found.")
-                    return@thread
                 }
 
                 var scannedBytes: ByteArray? = null
@@ -164,7 +158,16 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     if (epOut != null && epIn != null) {
-                        scannedBytes = tryEsclScan(connection, epOut, epIn, isColor)
+                        // Step A: Probe if LEDM HTTP server responds
+                        val probeReq = "GET /DevMgmt/DiscoveryTree.xml HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                        val probeResp = sendHttpOverUsb(connection, epOut, epIn, probeReq.toByteArray(), 4000)
+                        if (probeResp != null) {
+                            val firstLine = String(probeResp, Charsets.ISO_8859_1).lineSequence().firstOrNull() ?: ""
+                            log("LEDM Probe: $firstLine")
+                            scannedBytes = tryLedmScan(connection, epOut, epIn, isColor)
+                        } else {
+                            log("No LEDM probe response on Interface #${intf.id}.")
+                        }
                     }
 
                     connection.releaseInterface(intf)
@@ -175,16 +178,16 @@ class MainActivity : AppCompatActivity() {
                     val bitmap: Bitmap? = BitmapFactory.decodeByteArray(scannedBytes, 0, scannedBytes.size)
                     if (bitmap != null) {
                         lastScannedJpeg = scannedBytes
-                        log("Scan complete! Size: ${scannedBytes.size / 1024} KB (${bitmap.width}x${bitmap.height})")
+                        log("Scan complete! ${scannedBytes.size / 1024} KB (${bitmap.width}x${bitmap.height})")
                         runOnUiThread {
                             ivPreview.setImageBitmap(bitmap)
                             btnSave.isEnabled = true
                         }
                     } else {
-                        log("Received ${scannedBytes.size} bytes, but could not decode as image.")
+                        log("Received ${scannedBytes.size} bytes, but could not decode as JPEG.")
                     }
                 } else {
-                    log("Scan did not return an image. Tap 'Copy Log' and share it so we can adjust the command.")
+                    log("Scan did not return an image. Share this log so we can adjust.")
                 }
             } catch (e: Exception) {
                 log("Error: ${e.message}")
@@ -195,73 +198,103 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun tryEsclScan(
+    private fun tryLedmScan(
         conn: UsbDeviceConnection,
         epOut: UsbEndpoint,
         epIn: UsbEndpoint,
         isColor: Boolean
     ): ByteArray? {
-        val colorMode = if (isColor) "RGB24" else "Grayscale8"
+        val colorSpace = if (isColor) "Color" else "Gray"
         val scanXml = """
             <?xml version="1.0" encoding="UTF-8"?>
-            <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
-              <pwg:Version>2.0</pwg:Version>
-              <pwg:ScanRegions>
-                <pwg:ScanRegion>
-                  <pwg:Height>3508</pwg:Height>
-                  <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
-                  <pwg:Width>2480</pwg:Width>
-                  <pwg:XOffset>0</pwg:XOffset>
-                  <pwg:YOffset>0</pwg:YOffset>
-                </pwg:ScanRegion>
-              </pwg:ScanRegions>
-              <scan:ColorMode>$colorMode</scan:ColorMode>
-              <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+            <scan:ScanJob xmlns:scan="http://www.hp.com/schemas/imaging/con/cnx/scan/2008/08/19" xmlns:dd="http://www.hp.com/schemas/imaging/con/dictionaries/1.0/">
               <scan:XResolution>200</scan:XResolution>
               <scan:YResolution>200</scan:YResolution>
-            </scan:ScanSettings>
+              <scan:XStart>0</scan:XStart>
+              <scan:YStart>0</scan:YStart>
+              <scan:Width>2480</scan:Width>
+              <scan:Height>3508</scan:Height>
+              <scan:Format>Jpeg</scan:Format>
+              <scan:CompressionQFactor>25</scan:CompressionQFactor>
+              <scan:ColorSpace>$colorSpace</scan:ColorSpace>
+              <scan:BitDepth>8</scan:BitDepth>
+              <scan:InputSource>Platen</scan:InputSource>
+              <scan:GrayRendering>NTSC</scan:GrayRendering>
+              <scan:ToneMap>
+                <scan:Gamma>1000</scan:Gamma>
+                <scan:Brightness>1000</scan:Brightness>
+                <scan:Contrast>1000</scan:Contrast>
+                <scan:Highlite>179</scan:Highlite>
+                <scan:Shadow>25</scan:Shadow>
+              </scan:ToneMap>
+              <scan:ContentType>Document</scan:ContentType>
+            </scan:ScanJob>
         """.trimIndent()
 
-        val postReq = "POST /eSCL/ScanJobs HTTP/1.1\r\n" +
+        val postReq = "POST /Scan/Jobs HTTP/1.1\r\n" +
                 "Host: localhost\r\n" +
                 "Content-Type: text/xml\r\n" +
                 "Content-Length: ${scanXml.toByteArray().size}\r\n" +
                 "\r\n" +
                 scanXml
 
-        log("Sending eSCL ScanJobs request ($colorMode, 200 DPI)...")
+        log("Sending HP LEDM ScanJob ($colorSpace, 200 DPI)...")
         val postResp = sendHttpOverUsb(conn, epOut, epIn, postReq.toByteArray(), 8000)
         if (postResp == null) {
-            log("No response to eSCL ScanJobs.")
+            log("No response to POST /Scan/Jobs.")
             return null
         }
 
         val respStr = String(postResp, Charsets.ISO_8859_1)
         val firstLine = respStr.lineSequence().firstOrNull() ?: ""
-        log("POST Response: $firstLine")
+        log("POST /Scan/Jobs -> $firstLine")
 
         if (!firstLine.contains("201")) {
-            log("Header snippet:\n${respStr.take(300)}")
+            log("Snippet:\n${respStr.take(300)}")
             return null
         }
 
-        // Extract Location header
         val locationLine = respStr.lineSequence().firstOrNull { it.startsWith("Location:", ignoreCase = true) }
         val rawLocation = locationLine?.substringAfter(":")?.trim() ?: return null
         val jobPath = if (rawLocation.startsWith("http")) {
-            rawLocation.substringAfter("://").substringAfter("/", "")
-                .let { "/$it" }
+            "/" + rawLocation.substringAfter("://").substringAfter("/", "")
         } else {
             rawLocation
         }
+        log("Job URL: $jobPath")
 
-        log("Job created at: $jobPath")
-        log("Scanning page... please wait (10-20s)...")
+        // Poll job status to get BinaryURL
+        var binaryUrl: String? = null
+        for (attempt in 1..10) {
+            Thread.sleep(1000)
+            val statusReq = "GET $jobPath HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            val statusResp = sendHttpOverUsb(conn, epOut, epIn, statusReq.toByteArray(), 5000)
+            if (statusResp != null) {
+                val statusStr = String(statusResp, Charsets.ISO_8859_1)
+                val match = Regex("<[^>]*BinaryURL>([^<]+)</[^>]*BinaryURL>").find(statusStr)
+                if (match != null) {
+                    binaryUrl = match.groupValues[1].trim()
+                    break
+                }
+            }
+        }
 
-        val getReq = "GET $jobPath/NextDocument HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        if (binaryUrl == null) {
+            log("Could not find BinaryURL in job status.")
+            return null
+        }
+
+        val docPath = if (binaryUrl.startsWith("http")) {
+            "/" + binaryUrl.substringAfter("://").substringAfter("/", "")
+        } else {
+            binaryUrl
+        }
+
+        log("Downloading scan from $docPath (wait 10-20s)...")
+        val getReq = "GET $docPath HTTP/1.1\r\nHost: localhost\r\n\r\n"
         val docResp = sendHttpOverUsb(conn, epOut, epIn, getReq.toByteArray(), 25000)
         if (docResp == null) {
-            log("No image data received from NextDocument.")
+            log("No image data received from BinaryURL.")
             return null
         }
 
@@ -289,7 +322,7 @@ class MainActivity : AppCompatActivity() {
             val read = conn.bulkTransfer(epIn, buf, buf.size, timeout)
             if (read > 0) {
                 out.write(buf, 0, read)
-                timeout = 1500 // Shorter timeout once data starts flowing
+                timeout = 1500
             } else {
                 break
             }
@@ -298,7 +331,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun extractHttpBody(rawResponse: ByteArray): ByteArray? {
-        // Find \r\n\r\n separating HTTP headers from JPEG body
         var headerEnd = -1
         for (i in 0 until rawResponse.size - 3) {
             if (rawResponse[i] == 13.toByte() && rawResponse[i + 1] == 10.toByte() &&
