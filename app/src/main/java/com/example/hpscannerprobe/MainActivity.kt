@@ -131,60 +131,43 @@ class MainActivity : AppCompatActivity() {
             }
 
             try {
-                // Prioritize Interface #0 (Class 255, Subclass 204 = HP Raw Scan)
-                val targetInterfaces = mutableListOf<UsbInterface>()
+                // Interface #0 (255/204/0) is the confirmed LEDM scanner interface
+                var scanIntf: UsbInterface? = null
                 for (i in 0 until device.interfaceCount) {
                     val intf = device.getInterface(i)
                     if (intf.interfaceClass == 255 && intf.interfaceSubclass == 204) {
-                        targetInterfaces.add(0, intf)
-                    } else if (intf.interfaceClass == 255 && intf.interfaceSubclass == 4) {
-                        targetInterfaces.add(intf)
+                        scanIntf = intf
+                        break
+                    }
+                }
+
+                if (scanIntf == null) {
+                    log("HP LEDM interface (255/204) not found.")
+                    return@thread
+                }
+
+                if (!connection.claimInterface(scanIntf, true)) {
+                    log("Could not claim Interface #${scanIntf.id}.")
+                    return@thread
+                }
+
+                var epOut: UsbEndpoint? = null
+                var epIn: UsbEndpoint? = null
+                for (e in 0 until scanIntf.endpointCount) {
+                    val ep = scanIntf.getEndpoint(e)
+                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                        if (ep.direction == UsbConstants.USB_DIR_OUT) epOut = ep
+                        if (ep.direction == UsbConstants.USB_DIR_IN) epIn = ep
                     }
                 }
 
                 var scannedBytes: ByteArray? = null
-                for (intf in targetInterfaces) {
-                    log("Trying Interface #${intf.id} (${intf.interfaceClass}/${intf.interfaceSubclass}/${intf.interfaceProtocol})...")
-                    if (!connection.claimInterface(intf, true)) {
-                        log("Could not claim Interface #${intf.id}")
-                        continue
-                    }
-
-                    var epOut: UsbEndpoint? = null
-                    var epIn: UsbEndpoint? = null
-                    for (e in 0 until intf.endpointCount) {
-                        val ep = intf.getEndpoint(e)
-                        if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                            if (ep.direction == UsbConstants.USB_DIR_OUT) epOut = ep
-                            if (ep.direction == UsbConstants.USB_DIR_IN) epIn = ep
-                        }
-                    }
-
-                    if (epOut != null && epIn != null) {
-                        // Probe 1: HP LEDM Discovery
-                        val ledmProbe = "GET /DevMgmt/DiscoveryTree.xml HTTP/1.1\r\nHost: localhost\r\n\r\n"
-                        val ledmResp = sendHttpOverUsb(connection, epOut, epIn, ledmProbe.toByteArray(), 3000)
-                        if (ledmResp != null) {
-                            val firstLine = String(ledmResp, Charsets.ISO_8859_1).lineSequence().firstOrNull() ?: ""
-                            log("LEDM Reply: $firstLine")
-                            scannedBytes = tryLedmScan(connection, epOut, epIn, isColor)
-                        } else {
-                            // Probe 2: eSCL Capabilities
-                            val esclProbe = "GET /eSCL/ScannerCapabilities HTTP/1.1\r\nHost: localhost\r\n\r\n"
-                            val esclResp = sendHttpOverUsb(connection, epOut, epIn, esclProbe.toByteArray(), 3000)
-                            if (esclResp != null) {
-                                val firstLine = String(esclResp, Charsets.ISO_8859_1).lineSequence().firstOrNull() ?: ""
-                                log("eSCL Reply: $firstLine")
-                                scannedBytes = tryEsclScan(connection, epOut, epIn, isColor)
-                            } else {
-                                log("No HTTP reply on Interface #${intf.id}.")
-                            }
-                        }
-                    }
-
-                    connection.releaseInterface(intf)
-                    if (scannedBytes != null) break
+                if (epOut != null && epIn != null) {
+                    drainUsbBuffer(connection, epIn)
+                    scannedBytes = tryLedmScan(connection, epOut, epIn, isColor)
                 }
+
+                connection.releaseInterface(scanIntf)
 
                 if (scannedBytes != null && scannedBytes.isNotEmpty()) {
                     val bitmap: Bitmap? = BitmapFactory.decodeByteArray(scannedBytes, 0, scannedBytes.size)
@@ -196,10 +179,10 @@ class MainActivity : AppCompatActivity() {
                             btnSave.isEnabled = true
                         }
                     } else {
-                        log("Received ${scannedBytes.size} bytes, but could not decode as JPEG.")
+                        log("Received ${scannedBytes.size} bytes, but could not decode JPEG.")
                     }
                 } else {
-                    log("Scan did not return an image. Share this log so we can adjust.")
+                    log("Scan failed. If you see 503, turn the printer off & on once.")
                 }
             } catch (e: Exception) {
                 log("Error: ${e.message}")
@@ -208,6 +191,16 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { btnScan.isEnabled = true }
             }
         }
+    }
+
+    private fun drainUsbBuffer(conn: UsbDeviceConnection, epIn: UsbEndpoint) {
+        val junk = ByteArray(16384)
+        var drained = 0
+        while (true) {
+            val r = conn.bulkTransfer(epIn, junk, junk.size, 150)
+            if (r > 0) drained += r else break
+        }
+        if (drained > 0) log("Cleared $drained B of leftover USB data.")
     }
 
     private fun tryLedmScan(
@@ -243,8 +236,8 @@ class MainActivity : AppCompatActivity() {
                 "\r\n" +
                 scanXml
 
-        log("Sending LEDM ScanJob ($colorSpace, 200 DPI)...")
-        val postResp = sendHttpOverUsb(conn, epOut, epIn, postReq.toByteArray(), 8000) ?: return null
+        log("Starting $colorSpace scan (200 DPI)...")
+        val postResp = sendHttpOverUsb(conn, epOut, epIn, postReq.toByteArray(), 8000, false) ?: return null
         val respStr = String(postResp, Charsets.ISO_8859_1)
         val firstLine = respStr.lineSequence().firstOrNull() ?: ""
         log("POST /Scan/Jobs -> $firstLine")
@@ -256,9 +249,8 @@ class MainActivity : AppCompatActivity() {
 
         var binaryUrl: String? = null
         for (attempt in 1..10) {
-            Thread.sleep(1000)
-            val statusReq = "GET $jobPath HTTP/1.1\r\nHost: localhost\r\n\r\n"
-            val statusResp = sendHttpOverUsb(conn, epOut, epIn, statusReq.toByteArray(), 5000)
+            Thread.sleep(800)
+            val statusResp = sendHttpOverUsb(conn, epOut, epIn, "GET $jobPath HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(), 5000, false)
             if (statusResp != null) {
                 val statusStr = String(statusResp, Charsets.ISO_8859_1)
                 val match = Regex("<[^>]*BinaryURL>([^<]+)</[^>]*BinaryURL>").find(statusStr)
@@ -271,52 +263,8 @@ class MainActivity : AppCompatActivity() {
 
         val docUrl = binaryUrl ?: return null
         val docPath = if (docUrl.startsWith("http")) "/" + docUrl.substringAfter("://").substringAfter("/", "") else docUrl
-        log("Downloading scan (wait 10-20s)...")
-        val docResp = sendHttpOverUsb(conn, epOut, epIn, "GET $docPath HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(), 25000) ?: return null
-        return extractHttpBody(docResp)
-    }
-
-    private fun tryEsclScan(
-        conn: UsbDeviceConnection,
-        epOut: UsbEndpoint,
-        epIn: UsbEndpoint,
-        isColor: Boolean
-    ): ByteArray? {
-        val colorMode = if (isColor) "RGB24" else "Grayscale8"
-        val scanXml = """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
-              <pwg:Version>2.0</pwg:Version>
-              <pwg:ScanRegions>
-                <pwg:ScanRegion>
-                  <pwg:Height>3508</pwg:Height>
-                  <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
-                  <pwg:Width>2480</pwg:Width>
-                  <pwg:XOffset>0</pwg:XOffset>
-                  <pwg:YOffset>0</pwg:YOffset>
-                </pwg:ScanRegion>
-              </pwg:ScanRegions>
-              <scan:ColorMode>$colorMode</scan:ColorMode>
-              <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
-              <scan:XResolution>200</scan:XResolution>
-              <scan:YResolution>200</scan:YResolution>
-            </scan:ScanSettings>
-        """.trimIndent()
-
-        val postReq = "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/xml\r\nContent-Length: ${scanXml.toByteArray().size}\r\n\r\n$scanXml"
-        log("Sending eSCL ScanJobs ($colorMode, 200 DPI)...")
-        val postResp = sendHttpOverUsb(conn, epOut, epIn, postReq.toByteArray(), 8000) ?: return null
-        val respStr = String(postResp, Charsets.ISO_8859_1)
-        val firstLine = respStr.lineSequence().firstOrNull() ?: ""
-        log("POST /eSCL/ScanJobs -> $firstLine")
-        if (!firstLine.contains("201")) return null
-
-        val locationLine = respStr.lineSequence().firstOrNull { it.startsWith("Location:", ignoreCase = true) }
-        val rawLocation = locationLine?.substringAfter(":")?.trim() ?: return null
-        val jobPath = if (rawLocation.startsWith("http")) "/" + rawLocation.substringAfter("://").substringAfter("/", "") else rawLocation
-
-        log("Downloading eSCL scan (wait 10-20s)...")
-        val docResp = sendHttpOverUsb(conn, epOut, epIn, "GET $jobPath/NextDocument HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(), 25000) ?: return null
+        log("Scanning & downloading... please wait until lamp stops.")
+        val docResp = sendHttpOverUsb(conn, epOut, epIn, "GET $docPath HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(), 25000, true) ?: return null
         return extractHttpBody(docResp)
     }
 
@@ -325,41 +273,81 @@ class MainActivity : AppCompatActivity() {
         epOut: UsbEndpoint,
         epIn: UsbEndpoint,
         requestBytes: ByteArray,
-        firstReadTimeoutMs: Int
+        firstReadTimeoutMs: Int,
+        isImageStream: Boolean
     ): ByteArray? {
-        val sent = conn.bulkTransfer(epOut, requestBytes, requestBytes.size, 3000)
+        val sent = conn.bulkTransfer(epOut, requestBytes, requestBytes.size, 5000)
         if (sent < 0) {
-            log("  USB OUT failed ($sent)")
+            log("USB OUT failed ($sent)")
             return null
         }
 
         val out = ByteArrayOutputStream()
         val buf = ByteArray(16384)
         var timeout = firstReadTimeoutMs
+        var emptyReads = 0
+        var headerEnd = -1
+        var isChunked = false
+        var contentLength = -1
 
         while (true) {
             val read = conn.bulkTransfer(epIn, buf, buf.size, timeout)
             if (read > 0) {
                 out.write(buf, 0, read)
-                timeout = 1200
+                emptyReads = 0
+                timeout = if (isImageStream) 6000 else 1500
+
+                val current = out.toByteArray()
+                if (headerEnd == -1) {
+                    headerEnd = findHeaderEnd(current)
+                    if (headerEnd != -1) {
+                        val hdrs = String(current, 0, headerEnd, Charsets.ISO_8859_1)
+                        isChunked = hdrs.contains("Transfer-Encoding: chunked", ignoreCase = true)
+                        val clLine = hdrs.lineSequence().firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+                        contentLength = clLine?.substringAfter(":")?.trim()?.toIntOrNull() ?: -1
+                    }
+                }
+
+                if (headerEnd != -1) {
+                    if (contentLength >= 0 && (current.size - headerEnd) >= contentLength) {
+                        break
+                    }
+                    if (isChunked && endsWithChunkedZero(current)) {
+                        break
+                    }
+                }
             } else {
-                if (out.size() == 0) log("  USB OUT ok ($sent B), IN returned $read")
-                break
+                emptyReads++
+                // For image streams, tolerate up to 2 consecutive timeouts while carriage pauses
+                if (!isImageStream || out.size() == 0 || emptyReads >= 2) {
+                    break
+                }
             }
         }
         return if (out.size() > 0) out.toByteArray() else null
     }
 
-    private fun extractHttpBody(rawResponse: ByteArray): ByteArray? {
-        var headerEnd = -1
-        for (i in 0 until rawResponse.size - 3) {
-            if (rawResponse[i] == 13.toByte() && rawResponse[i + 1] == 10.toByte() &&
-                rawResponse[i + 2] == 13.toByte() && rawResponse[i + 3] == 10.toByte()
+    private fun findHeaderEnd(data: ByteArray): Int {
+        for (i in 0 until data.size - 3) {
+            if (data[i] == 13.toByte() && data[i + 1] == 10.toByte() &&
+                data[i + 2] == 13.toByte() && data[i + 3] == 10.toByte()
             ) {
-                headerEnd = i + 4
-                break
+                return i + 4
             }
         }
+        return -1
+    }
+
+    private fun endsWithChunkedZero(data: ByteArray): Boolean {
+        if (data.size < 5) return false
+        val n = data.size
+        return data[n - 5] == '0'.code.toByte() &&
+                data[n - 4] == 13.toByte() && data[n - 3] == 10.toByte() &&
+                data[n - 2] == 13.toByte() && data[n - 1] == 10.toByte()
+    }
+
+    private fun extractHttpBody(rawResponse: ByteArray): ByteArray? {
+        val headerEnd = findHeaderEnd(rawResponse)
         if (headerEnd == -1) return null
 
         val headers = String(rawResponse, 0, headerEnd, Charsets.ISO_8859_1)
