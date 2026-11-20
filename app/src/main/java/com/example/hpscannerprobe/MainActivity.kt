@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.pdf.PdfDocument
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
@@ -28,6 +29,8 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
@@ -37,9 +40,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ivPreview: ImageView
     private lateinit var btnScan: Button
     private lateinit var btnSave: Button
+    private lateinit var btnSavePdf: Button
     private lateinit var rbColor: RadioButton
 
     private var lastScannedJpeg: ByteArray? = null
+    private var lastScannedBitmap: Bitmap? = null
     private val actionUsbPermission = "com.hpscannerprobe.USB_PERMISSION"
 
     private val usbReceiver = object : BroadcastReceiver() {
@@ -71,6 +76,7 @@ class MainActivity : AppCompatActivity() {
         ivPreview = findViewById(R.id.ivPreview)
         btnScan = findViewById(R.id.btnScan)
         btnSave = findViewById(R.id.btnSave)
+        btnSavePdf = findViewById(R.id.btnSavePdf)
         rbColor = findViewById(R.id.rbColor)
         val btnCopy: Button = findViewById(R.id.btnCopy)
 
@@ -83,6 +89,7 @@ class MainActivity : AppCompatActivity() {
 
         btnScan.setOnClickListener { initiateScan() }
         btnSave.setOnClickListener { saveLastScanToGallery() }
+        btnSavePdf.setOnClickListener { saveLastScanAsPdf() }
         btnCopy.setOnClickListener {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("HP Scan Log", tvLog.text.toString()))
@@ -99,6 +106,7 @@ class MainActivity : AppCompatActivity() {
         tvLog.text = ""
         btnScan.isEnabled = false
         btnSave.isEnabled = false
+        btnSavePdf.isEnabled = false
 
         val hpDevice = usbManager.deviceList.values.firstOrNull { it.vendorId == 0x03F0 }
             ?: usbManager.deviceList.values.firstOrNull()
@@ -131,7 +139,6 @@ class MainActivity : AppCompatActivity() {
             }
 
             try {
-                // Interface #0 (255/204/0) is the confirmed LEDM scanner interface
                 var scanIntf: UsbInterface? = null
                 for (i in 0 until device.interfaceCount) {
                     val intf = device.getInterface(i)
@@ -173,10 +180,12 @@ class MainActivity : AppCompatActivity() {
                     val bitmap: Bitmap? = BitmapFactory.decodeByteArray(scannedBytes, 0, scannedBytes.size)
                     if (bitmap != null) {
                         lastScannedJpeg = scannedBytes
+                        lastScannedBitmap = bitmap
                         log("Scan complete! ${scannedBytes.size / 1024} KB (${bitmap.width}x${bitmap.height})")
                         runOnUiThread {
                             ivPreview.setImageBitmap(bitmap)
                             btnSave.isEnabled = true
+                            btnSavePdf.isEnabled = true
                         }
                     } else {
                         log("Received ${scannedBytes.size} bytes, but could not decode JPEG.")
@@ -318,7 +327,6 @@ class MainActivity : AppCompatActivity() {
                 }
             } else {
                 emptyReads++
-                // For image streams, tolerate up to 2 consecutive timeouts while carriage pauses
                 if (!isImageStream || out.size() == 0 || emptyReads >= 2) {
                     break
                 }
@@ -396,9 +404,49 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) {
             contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
             Toast.makeText(this, "Saved to Pictures/HPScanner/$filename", Toast.LENGTH_LONG).show()
-            log("Saved: Pictures/HPScanner/$filename")
+            log("Saved JPG: Pictures/HPScanner/$filename")
         } else {
             Toast.makeText(this, "Failed to save image", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun saveLastScanAsPdf() {
+        val bitmap = lastScannedBitmap ?: return
+        val filename = "HP_Scan_${System.currentTimeMillis()}.pdf"
+
+        val pdfDocument = PdfDocument()
+        val pageInfo = PdfDocument.PageInfo.Builder(bitmap.width, bitmap.height, 1).create()
+        val page = pdfDocument.startPage(pageInfo)
+        page.canvas.drawBitmap(bitmap, 0f, 0f, null)
+        pdfDocument.finishPage(page)
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, filename)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/HPScanner")
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    contentResolver.openOutputStream(uri)?.use { pdfDocument.writeTo(it) }
+                    Toast.makeText(this, "Saved to Downloads/HPScanner/$filename", Toast.LENGTH_LONG).show()
+                    log("Saved PDF: Downloads/HPScanner/$filename")
+                } else {
+                    Toast.makeText(this, "Failed to create PDF file", Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                val dir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
+                val file = File(dir, filename)
+                FileOutputStream(file).use { pdfDocument.writeTo(it) }
+                Toast.makeText(this, "Saved PDF: ${file.name}", Toast.LENGTH_LONG).show()
+                log("Saved PDF: ${file.absolutePath}")
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "PDF Error: ${e.message}", Toast.LENGTH_LONG).show()
+            log("PDF Error: ${e.message}")
+        } finally {
+            pdfDocument.close()
         }
     }
 
