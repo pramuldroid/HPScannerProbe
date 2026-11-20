@@ -5,6 +5,13 @@
     android:orientation="vertical"
     android:padding="14dp">
 
+    <Button
+        android:id="@+id/btnScan"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Scan Document"
+        android:layout_marginBottom="8dp" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -12,18 +19,20 @@
         android:layout_marginBottom="8dp">
 
         <Button
-            android:id="@+id/btnScan"
+            android:id="@+id/btnSave"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Scan Document"
+            android:text="Save JPG"
+            android:enabled="false"
             android:layout_marginEnd="6dp" />
 
         <Button
-            android:id="@+id/btnSave"
-            android:layout_width="wrap_content"
+            android:id="@+id/btnSavePdf"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="Save"
+            android:layout_weight="1"
+            android:text="Save PDF"
             android:enabled="false" />
     </LinearLayout>
 
